@@ -673,7 +673,7 @@ else:
                     f"<b>{view_choice}:</b> %{{customdata[0]}}<br>"
                     "<b>Overdue Works:</b> %{x}<br>"
                     "<b>Total Works Assigned:</b> %{customdata[1]}<br>"
-                    "<b>Ongoing ('P') Works:</b> %{customdata[2]}<br>"
+                    "<b>Ongoing ('Progress') Works:</b> %{customdata[2]}<br>"
                     "<b>Overdue Percentage:</b> %{customdata[3]:.1f}%<extra></extra>"
                 ),
             )
