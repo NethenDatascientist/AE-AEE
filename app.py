@@ -51,11 +51,9 @@ COL_AEE = "ಸಹಾಯಕ ಕಾರ್ಯಪಾಲಕ ಇಂಜಿನಿಯರ�
 COL_TARGET_DATE = "ಕಾಮಗಾರಿ ಮುಕ್ತಾಯಗೊಳಿಸಬೇಕಾದ ದಿನಾಂಕ"
 COL_ACTUAL_DATE = "ಮುಕ್ತಾಯವಾದ ದಿನಾಂಕ"
 
-# Paste your Google Sheet URL inside st.secrets["SHEET_URL"] on Streamlit Cloud,
-# or replace the placeholder string below directly:
-DEFAULT_SHEET_URL = st.secrets.get(
-    "SHEET_URL",
-    "PASTE_YOUR_GOOGLE_SHEET_LINK_HERE",
+DEFAULT_SHEET_URL = (
+    "https://docs.google.com/spreadsheets/d/"
+    "13W04z-fdU3RhuVJ5vQFRpK4BBSQRJWfscPqpr7Oj2Y8/edit?gid=1055199869#gid=1055199869"
 )
 
 
@@ -78,36 +76,41 @@ def extract_export_url(sheet_url: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{spreadsheet_key}/export?format=xlsx"
 
 
-def find_matching_columns(columns: list[str]) -> dict:
+def find_matching_column_indices(headers: list[str]) -> dict:
     """
-    Find required columns flexibly across sheets:
+    Find required column indices (0-based positions) across sheets:
     - ಶಾಖಾಧಿಕಾರಿಯ ಹೆಸರು
     - ಸಹಾಯಕ ಕಾರ್ಯಪಾಲಕ ಇಂಜಿನಿಯರ್ ಹೆಸರು
     - ಕಾಮಗಾರಿ ಮುಕ್ತಾಯಗೊಳಿಸಬೇಕಾದ ದಿನಾಂಕ
     - ಮುಕ್ತಾಯವಾದ ದಿನಾಂಕ
     - Status column containing 'CP/CF' anywhere in the header
     """
-    col_map = {}
-    for col in columns:
+    col_idx_map = {}
+    for idx, col in enumerate(headers):
         norm_col = normalize_text(col)
         upper_col = norm_col.upper()
+        compact_upper = re.sub(r"\s+", "", upper_col)
 
-        if COL_SO in norm_col and "so" not in col_map:
-            col_map["so"] = col
-        elif COL_AEE in norm_col and "aee" not in col_map:
-            col_map["aee"] = col
-        elif COL_TARGET_DATE in norm_col and "target_date" not in col_map:
-            col_map["target_date"] = col
+        if (COL_SO in norm_col or "ಶಾಖಾಧಿಕಾರಿ" in norm_col) and "so" not in col_idx_map:
+            col_idx_map["so"] = idx
+        elif (
+            COL_AEE in norm_col or "ಸಹಾಯಕ ಕಾರ್ಯಪಾಲಕ ಇಂಜಿನಿಯರ್" in norm_col
+        ) and "aee" not in col_idx_map:
+            col_idx_map["aee"] = idx
+        elif (
+            COL_TARGET_DATE in norm_col or "ಮುಕ್ತಾಯಗೊಳಿಸಬೇಕಾದ ದಿನಾಂಕ" in norm_col
+        ) and "target_date" not in col_idx_map:
+            col_idx_map["target_date"] = idx
         elif (
             COL_ACTUAL_DATE in norm_col
             and "ಮುಕ್ತಾಯಗೊಳಿಸಬೇಕಾದ" not in norm_col
-            and "actual_date" not in col_map
+            and "actual_date" not in col_idx_map
         ):
-            col_map["actual_date"] = col
-        elif "CP/CF" in upper_col and "status" not in col_map:
-            col_map["status"] = col
+            col_idx_map["actual_date"] = idx
+        elif "CP/CF" in compact_upper and "status" not in col_idx_map:
+            col_idx_map["status"] = idx
 
-    return col_map
+    return col_idx_map
 
 
 def parse_indian_date(series: pd.Series) -> pd.Series:
@@ -120,7 +123,6 @@ def parse_indian_date(series: pd.Series) -> pd.Series:
         s = normalize_text(val)
         if not s or s.upper() in {"-", "--", "NIL", "NA", "N/A", "NONE", ""}:
             return pd.NaT
-        # Replace dots with dashes for formats like 15.08.2026
         s = re.sub(r"[./]", "-", s)
         return s
 
@@ -159,10 +161,9 @@ def load_and_process_sheets(sheet_url: str):
     response = requests.get(export_url, timeout=60)
     response.raise_for_status()
 
-    # Load all worksheets once
     excel_file = pd.ExcelFile(io.BytesIO(response.content), engine="openpyxl")
 
-    # Build lookup map normalized by whitespace so minor tab spacing differences still match
+    # Lookup map normalized by whitespace and case
     available_sheets = {
         normalize_text(name).lower(): name for name in excel_file.sheet_names
     }
@@ -182,88 +183,107 @@ def load_and_process_sheets(sheet_url: str):
             )
             continue
 
-        raw_df = pd.read_excel(excel_file, sheet_name=actual_sheet_name, header=None)
-        if raw_df.empty:
-            sheet_diagnostics.append(
-                {"Sheet": target, "Status": "Empty Sheet", "Rows Loaded": 0}
+        try:
+            raw_df = pd.read_excel(excel_file, sheet_name=actual_sheet_name, header=None)
+            if raw_df.empty:
+                sheet_diagnostics.append(
+                    {"Sheet": target, "Status": "Empty Sheet", "Rows Loaded": 0}
+                )
+                continue
+
+            # Dynamically locate the header row within the first 25 rows
+            header_idx = None
+            for idx in range(min(25, len(raw_df))):
+                row_text = " | ".join(normalize_text(v) for v in raw_df.iloc[idx].values)
+                if (
+                    COL_SO in row_text
+                    or COL_AEE in row_text
+                    or "ಶಾಖಾಧಿಕಾರಿ" in row_text
+                ):
+                    header_idx = idx
+                    break
+
+            if header_idx is None:
+                sheet_diagnostics.append(
+                    {"Sheet": target, "Status": "Header Row Not Found", "Rows Loaded": 0}
+                )
+                continue
+
+            headers = [normalize_text(col) for col in raw_df.iloc[header_idx].values]
+            col_idx_map = find_matching_column_indices(headers)
+
+            required_keys = {"so", "aee", "target_date", "actual_date", "status"}
+            missing_keys = required_keys - set(col_idx_map.keys())
+
+            if missing_keys:
+                sheet_diagnostics.append(
+                    {
+                        "Sheet": target,
+                        "Status": f"Missing Columns: {', '.join(sorted(missing_keys))}",
+                        "Rows Loaded": 0,
+                    }
+                )
+                continue
+
+            # Reset index immediately after slicing below header row so indices start at 0
+            df = raw_df.iloc[header_idx + 1 :].reset_index(drop=True).copy()
+
+            s_so = df.iloc[:, col_idx_map["so"]].map(normalize_text)
+            s_aee = df.iloc[:, col_idx_map["aee"]].map(normalize_text)
+            s_status = df.iloc[:, col_idx_map["status"]].map(normalize_text)
+            s_target_raw = df.iloc[:, col_idx_map["target_date"]]
+            s_actual_raw = df.iloc[:, col_idx_map["actual_date"]]
+
+            sub = pd.DataFrame(
+                {
+                    "sheet_name": target,
+                    "so_name": s_so,
+                    "aee_name": s_aee,
+                    "status_raw": s_status,
+                    "target_date_raw": s_target_raw.map(normalize_text),
+                    "actual_date_raw": s_actual_raw.map(normalize_text),
+                    "target_dt": parse_indian_date(s_target_raw),
+                    "actual_empty": is_empty_date(s_actual_raw),
+                }
             )
-            continue
 
-        # Dynamically find the header row within the first 20 rows
-        header_idx = None
-        for idx in range(min(20, len(raw_df))):
-            row_text = " | ".join(normalize_text(v) for v in raw_df.iloc[idx].values)
-            if COL_SO in row_text or COL_AEE in row_text:
-                header_idx = idx
-                break
+            # Keep only rows that have an officer name or status entry
+            sub = sub[
+                (sub["status_raw"] != "")
+                | (sub["so_name"] != "")
+                | (sub["aee_name"] != "")
+            ].reset_index(drop=True)
 
-        if header_idx is None:
-            sheet_diagnostics.append(
-                {"Sheet": target, "Status": "Header Row Not Found", "Rows Loaded": 0}
+            sub["is_status_p"] = sub["status_raw"].str.upper() == "P"
+
+            # Overdue Logic:
+            # 1. Status is 'P' or 'p' under CP/CF column
+            # 2. ಕಾಮಗಾರಿ ಮುಕ್ತಾಯಗೊಳಿಸಬೇಕಾದ ದಿನಾಂಕ < Today's Date
+            # 3. ಮುಕ್ತಾಯವಾದ ದಿನಾಂಕ is empty
+            sub["is_overdue"] = (
+                sub["is_status_p"]
+                & sub["target_dt"].notna()
+                & (sub["target_dt"] < today_ist)
+                & sub["actual_empty"]
             )
-            continue
 
-        # Slice data below the detected header row
-        headers = [
-            f"{normalize_text(col)}_{i}" if pd.isna(col) else normalize_text(col)
-            for i, col in enumerate(raw_df.iloc[header_idx].values)
-        ]
-        df = raw_df.iloc[header_idx + 1 :].copy()
-        df.columns = headers
-
-        col_map = find_matching_columns(df.columns.tolist())
-        required_keys = {"so", "aee", "target_date", "actual_date", "status"}
-        missing_keys = required_keys - set(col_map.keys())
-
-        if missing_keys:
+            compiled_rows.append(sub)
             sheet_diagnostics.append(
                 {
                     "Sheet": target,
-                    "Status": f"Missing Columns: {', '.join(missing_keys)}",
+                    "Status": "Loaded",
+                    "Rows Loaded": len(sub),
+                }
+            )
+
+        except Exception as sheet_err:
+            sheet_diagnostics.append(
+                {
+                    "Sheet": target,
+                    "Status": f"Error: {sheet_err}",
                     "Rows Loaded": 0,
                 }
             )
-            continue
-
-        sub = pd.DataFrame()
-        sub["sheet_name"] = [target] * len(df)
-        sub["so_name"] = df[col_map["so"]].map(normalize_text)
-        sub["aee_name"] = df[col_map["aee"]].map(normalize_text)
-        sub["status_raw"] = df[col_map["status"]].map(normalize_text)
-        sub["target_date_raw"] = df[col_map["target_date"]].map(normalize_text)
-        sub["actual_date_raw"] = df[col_map["actual_date"]].map(normalize_text)
-
-        # Keep rows that represent an actual work entry (has status or officer assigned)
-        sub = sub[
-            (sub["status_raw"] != "")
-            | (sub["so_name"] != "")
-            | (sub["aee_name"] != "")
-        ].copy()
-
-        # Parse dates and evaluate overdue logic
-        sub["target_dt"] = parse_indian_date(df.loc[sub.index, col_map["target_date"]])
-        sub["actual_empty"] = is_empty_date(df.loc[sub.index, col_map["actual_date"]])
-        sub["is_status_p"] = sub["status_raw"].str.upper() == "P"
-
-        # Overdue logic:
-        # 1. Status under CP/CF column is 'P' or 'p'
-        # 2. ಕಾಮಗಾರಿ ಮುಕ್ತಾಯಗೊಳಿಸಬೇಕಾದ ದಿನಾಂಕ < Today
-        # 3. ಮುಕ್ತಾಯವಾದ ದಿನಾಂಕ is empty
-        sub["is_overdue"] = (
-            sub["is_status_p"]
-            & sub["target_dt"].notna()
-            & (sub["target_dt"] < today_ist)
-            & sub["actual_empty"]
-        )
-
-        compiled_rows.append(sub)
-        sheet_diagnostics.append(
-            {
-                "Sheet": target,
-                "Status": "Loaded",
-                "Rows Loaded": len(sub),
-            }
-        )
 
     master_df = (
         pd.concat(compiled_rows, ignore_index=True)
@@ -306,27 +326,25 @@ if st.sidebar.button("🔄 Refresh Live Data"):
 # -----------------------------------------------------------------------------
 st.title("📊 Minor Irrigation — Overdue Works Dashboard")
 
-if (
-    not sheet_url_input
-    or "PASTE_YOUR_GOOGLE_SHEET_LINK_HERE" in sheet_url_input
-):
-    st.info(
-        "Please paste your Google Sheet link in the sidebar (or set `SHEET_URL` in Streamlit Secrets) to load the dashboard."
-    )
+if not sheet_url_input:
+    st.info("Please paste your Google Sheet link in the sidebar to load the dashboard.")
     st.stop()
 
 with st.spinner("Fetching and processing 23 worksheets from Google Sheets..."):
     try:
         master_df, diag_df, today_str = load_and_process_sheets(sheet_url_input)
-    except Exception as e:
+    except requests.HTTPError as http_err:
         st.error(
-            f"Unable to read the Google Sheet. Make sure link sharing is set to 'Anyone with the link can view'.\n\nDetails: {e}"
+            f"Google Sheets HTTP Error: Make sure link sharing is set to 'Anyone with the link can view'.\n\nDetails: {http_err}"
         )
+        st.stop()
+    except Exception as e:
+        st.error(f"Error while processing workbook: {e}")
         st.stop()
 
 if master_df.empty:
     st.warning("No matching data rows were found across the target worksheets.")
-    st.dataframe(diag_df)
+    st.dataframe(diag_df, use_container_width=True)
     st.stop()
 
 # -----------------------------------------------------------------------------
@@ -414,7 +432,10 @@ fig.add_trace(
         x=plot_df["total_works"],
         name="Total Works Assigned",
         orientation="h",
-        marker=dict(color="rgba(148, 163, 184, 0.35)", line=dict(color="#64748B", width=1)),
+        marker=dict(
+            color="rgba(148, 163, 184, 0.35)",
+            line=dict(color="#64748B", width=1),
+        ),
         hovertemplate=(
             f"<b>{view_choice}:</b> %{{y}}<br>"
             "<b>Total Works Assigned:</b> %{x}<extra></extra>"
