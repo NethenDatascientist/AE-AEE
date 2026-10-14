@@ -15,6 +15,26 @@ st.set_page_config(
     page_title="Overdue Works Dashboard",
     page_icon="📊",
     layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# Force full screen width and fix top metric clipping
+st.markdown(
+    """
+    <style>
+        .block-container {
+            max-width: 100% !important;
+            padding-left: 1.2rem !important;
+            padding-right: 1.2rem !important;
+            padding-top: 2.8rem !important;
+            padding-bottom: 2rem !important;
+        }
+        [data-testid="stPlotlyChart"] {
+            width: 100% !important;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 # -----------------------------------------------------------------------------
@@ -77,14 +97,7 @@ def extract_export_url(sheet_url: str) -> str:
 
 
 def find_matching_column_indices(headers: list[str]) -> dict:
-    """
-    Find required column indices (0-based positions) across sheets:
-    - ಶಾಖಾಧಿಕಾರಿಯ ಹೆಸರು
-    - ಸಹಾಯಕ ಕಾರ್ಯಪಾಲಕ ಇಂಜಿನಿಯರ್ ಹೆಸರು
-    - ಕಾಮಗಾರಿ ಮುಕ್ತಾಯಗೊಳಿಸಬೇಕಾದ ದಿನಾಂಕ
-    - ಮುಕ್ತಾಯವಾದ ದಿನಾಂಕ
-    - Status column containing 'CP/CF' anywhere in the header
-    """
+    """Find required 0-based column positions across sheets."""
     col_idx_map = {}
     for idx, col in enumerate(headers):
         norm_col = normalize_text(col)
@@ -143,15 +156,22 @@ def is_empty_date(series: pd.Series) -> pd.Series:
 
 def is_valid_officer_name(name: str) -> bool:
     """Filter out empty cells, serial numbers, or summary rows like 'ಒಟ್ಟು' / 'Total'."""
-    if not name:
+    if not name or len(name) > 65:
         return False
     upper = name.upper()
-    invalid_tokens = {"NAN", "NONE", "-", "--", "NIL", "NA", "N/A", "0"}
+    invalid_tokens = {
+        "NAN", "NONE", "-", "--", "---", "NIL", "NA", "N/A", "0", "ಇಲ್ಲ", "ಖಾಲಿ"
+    }
     if upper in invalid_tokens or name.isdigit():
         return False
     if "ಒಟ್ಟು" in name or "TOTAL" in upper or COL_SO in name or COL_AEE in name:
         return False
     return True
+
+
+def shorten_label(name: str, max_len: int = 26) -> str:
+    """Keep Y-axis labels compact so the chart always starts on the far left."""
+    return name if len(name) <= max_len else name[: max_len - 1] + "…"
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -163,7 +183,6 @@ def load_and_process_sheets(sheet_url: str):
 
     excel_file = pd.ExcelFile(io.BytesIO(response.content), engine="openpyxl")
 
-    # Lookup map normalized by whitespace and case
     available_sheets = {
         normalize_text(name).lower(): name for name in excel_file.sheet_names
     }
@@ -191,7 +210,6 @@ def load_and_process_sheets(sheet_url: str):
                 )
                 continue
 
-            # Dynamically locate the header row within the first 25 rows
             header_idx = None
             for idx in range(min(25, len(raw_df))):
                 row_text = " | ".join(normalize_text(v) for v in raw_df.iloc[idx].values)
@@ -225,7 +243,6 @@ def load_and_process_sheets(sheet_url: str):
                 )
                 continue
 
-            # Reset index immediately after slicing below header row so indices start at 0
             df = raw_df.iloc[header_idx + 1 :].reset_index(drop=True).copy()
 
             s_so = df.iloc[:, col_idx_map["so"]].map(normalize_text)
@@ -247,7 +264,6 @@ def load_and_process_sheets(sheet_url: str):
                 }
             )
 
-            # Keep only rows that have an officer name or status entry
             sub = sub[
                 (sub["status_raw"] != "")
                 | (sub["so_name"] != "")
@@ -256,10 +272,6 @@ def load_and_process_sheets(sheet_url: str):
 
             sub["is_status_p"] = sub["status_raw"].str.upper() == "P"
 
-            # Overdue Logic:
-            # 1. Status is 'P' or 'p' under CP/CF column
-            # 2. ಕಾಮಗಾರಿ ಮುಕ್ತಾಯಗೊಳಿಸಬೇಕಾದ ದಿನಾಂಕ < Today's Date
-            # 3. ಮುಕ್ತಾಯವಾದ ದಿನಾಂಕ is empty
             sub["is_overdue"] = (
                 sub["is_status_p"]
                 & sub["target_dt"].notna()
@@ -312,10 +324,21 @@ denominator_mode = st.sidebar.radio(
         "Only Ongoing Works (Status = 'P')",
     ],
     index=0,
-    help=(
-        "Choose whether 'Total Works Assigned' counts every work row assigned to the officer "
-        "across the 23 sheets, or only works currently marked 'P' / 'p'."
-    ),
+)
+
+chart_style = st.sidebar.radio(
+    "Bar Width Mode:",
+    options=[
+        "Scale by Overdue Works (Full-Width Bars)",
+        "Overlay (Overdue inside Total Works)",
+    ],
+    index=0,
+    help="Full-Width Bars stretches the highest overdue bar across the full screen width.",
+)
+
+hide_zero_overdue = st.sidebar.checkbox(
+    "Show only officers with Overdue > 0",
+    value=False,
 )
 
 if st.sidebar.button("🔄 Refresh Live Data"):
@@ -358,13 +381,11 @@ view_choice = st.radio(
 
 group_col = "so_name" if view_choice == COL_SO else "aee_name"
 
-# Filter valid officer names for the selected view
 valid_df = master_df[master_df[group_col].map(is_valid_officer_name)].copy()
 
 if denominator_mode == "Only Ongoing Works (Status = 'P')":
     valid_df = valid_df[valid_df["is_status_p"]].copy()
 
-# Aggregate per officer
 summary_df = (
     valid_df.groupby(group_col, as_index=False)
     .agg(
@@ -408,89 +429,141 @@ k4.metric(
 st.divider()
 
 # -----------------------------------------------------------------------------
-# HORIZONTAL BAR CHART (HIGHEST OVERDUE AT THE TOP)
+# HORIZONTAL BAR CHART (FULL WIDTH & LEFT ALIGNED)
 # -----------------------------------------------------------------------------
 st.subheader(f"📈 Overdue Works by {view_choice}")
 
-# Reverse order for Plotly horizontal bar so highest overdue renders at the TOP
-plot_df = summary_df.iloc[::-1].copy()
-
-plot_df["bar_label"] = plot_df.apply(
-    lambda r: (
-        f"  <b>{int(r['overdue_works'])} Overdue</b> / "
-        f"{int(r['total_works'])} Total ({r['overdue_pct']:.1f}%)"
-    ),
-    axis=1,
+chart_source_df = (
+    summary_df[summary_df["overdue_works"] > 0].copy()
+    if hide_zero_overdue
+    else summary_df.copy()
 )
 
-fig = go.Figure()
+if chart_source_df.empty:
+    st.info("No officers match the current filter.")
+else:
+    # Reverse order so highest overdue renders at the TOP of the horizontal bar chart
+    plot_df = chart_source_df.iloc[::-1].copy()
 
-# Background / companion bar showing Total Works Assigned
-fig.add_trace(
-    go.Bar(
-        y=plot_df[view_choice],
-        x=plot_df["total_works"],
-        name="Total Works Assigned",
-        orientation="h",
-        marker=dict(
-            color="rgba(148, 163, 184, 0.35)",
-            line=dict(color="#64748B", width=1),
+    # Create compact Y-axis display labels so long strings never push the chart right
+    plot_df["y_short"] = plot_df[view_choice].map(lambda s: shorten_label(s, 28))
+
+    plot_df["bar_label"] = plot_df.apply(
+        lambda r: (
+            f"  <b>{int(r['overdue_works'])} Overdue</b> / "
+            f"{int(r['total_works'])} Total ({r['overdue_pct']:.1f}%)"
         ),
-        hovertemplate=(
-            f"<b>{view_choice}:</b> %{{y}}<br>"
-            "<b>Total Works Assigned:</b> %{x}<extra></extra>"
-        ),
+        axis=1,
     )
-)
 
-# Foreground bar showing Overdue Works + rich text annotation
-fig.add_trace(
-    go.Bar(
-        y=plot_df[view_choice],
-        x=plot_df["overdue_works"],
-        name="Overdue Works",
-        orientation="h",
-        marker=dict(color="#DC2626"),
-        text=plot_df["bar_label"],
-        textposition="outside",
-        cliponaxis=False,
-        customdata=plot_df[["total_works", "ongoing_p_works", "overdue_pct"]],
-        hovertemplate=(
-            f"<b>{view_choice}:</b> %{{y}}<br>"
-            "<b>Overdue Works:</b> %{x}<br>"
-            "<b>Total Works Assigned:</b> %{customdata[0]}<br>"
-            "<b>Ongoing ('P') Works:</b> %{customdata[1]}<br>"
-            "<b>Overdue Percentage:</b> %{customdata[2]:.1f}%<extra></extra>"
+    fig = go.Figure()
+
+    if chart_style == "Scale by Overdue Works (Full-Width Bars)":
+        fig.add_trace(
+            go.Bar(
+                y=plot_df[view_choice],
+                x=plot_df["overdue_works"],
+                name="Overdue Works",
+                orientation="h",
+                marker=dict(
+                    color="#EF4444",
+                    line=dict(color="#DC2626", width=1),
+                ),
+                text=plot_df["bar_label"],
+                textposition="outside",
+                textfont=dict(size=13),
+                cliponaxis=False,
+                customdata=plot_df[
+                    [view_choice, "total_works", "ongoing_p_works", "overdue_pct"]
+                ],
+                hovertemplate=(
+                    f"<b>{view_choice}:</b> %{{customdata[0]}}<br>"
+                    "<b>Overdue Works:</b> %{x}<br>"
+                    "<b>Total Works Assigned:</b> %{customdata[1]}<br>"
+                    "<b>Ongoing ('P') Works:</b> %{customdata[2]}<br>"
+                    "<b>Overdue Percentage:</b> %{customdata[3]:.1f}%<extra></extra>"
+                ),
+            )
+        )
+        max_x = max(int(plot_df["overdue_works"].max()), 1)
+        x_range_max = max_x * 1.24
+    else:
+        # Overlay mode: Total Works Assigned in background, Overdue Works in foreground
+        fig.add_trace(
+            go.Bar(
+                y=plot_df[view_choice],
+                x=plot_df["total_works"],
+                name="Total Works Assigned",
+                orientation="h",
+                marker=dict(
+                    color="rgba(148, 163, 184, 0.30)",
+                    line=dict(color="#64748B", width=1),
+                ),
+                text=plot_df["bar_label"],
+                textposition="outside",
+                textfont=dict(size=13),
+                cliponaxis=False,
+                customdata=plot_df[[view_choice]],
+                hovertemplate=(
+                    f"<b>{view_choice}:</b> %{{customdata[0]}}<br>"
+                    "<b>Total Works Assigned:</b> %{x}<extra></extra>"
+                ),
+            )
+        )
+        fig.add_trace(
+            go.Bar(
+                y=plot_df[view_choice],
+                x=plot_df["overdue_works"],
+                name="Overdue Works",
+                orientation="h",
+                marker=dict(color="#EF4444"),
+                customdata=plot_df[
+                    [view_choice, "total_works", "ongoing_p_works", "overdue_pct"]
+                ],
+                hovertemplate=(
+                    f"<b>{view_choice}:</b> %{{customdata[0]}}<br>"
+                    "<b>Overdue Works:</b> %{x}<br>"
+                    "<b>Total Works Assigned:</b> %{customdata[1]}<br>"
+                    "<b>Ongoing ('P') Works:</b> %{customdata[2]}<br>"
+                    "<b>Overdue Percentage:</b> %{customdata[3]:.1f}%<extra></extra>"
+                ),
+            )
+        )
+        max_x = max(int(plot_df["total_works"].max()), 1)
+        x_range_max = max_x * 1.24
+
+    chart_height = max(500, len(plot_df) * 36 + 90)
+
+    fig.update_layout(
+        barmode="overlay",
+        height=chart_height,
+        bargap=0.22,
+        xaxis=dict(
+            title="Number of Works",
+            range=[0, x_range_max],
+            gridcolor="rgba(200, 200, 200, 0.2)",
+            zeroline=True,
         ),
+        yaxis=dict(
+            title="",
+            automargin=False,
+            tickmode="array",
+            tickvals=plot_df[view_choice],
+            ticktext=plot_df["y_short"],
+            tickfont=dict(size=13),
+        ),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.01,
+            xanchor="left",
+            x=0,
+        ),
+        # Fixed 210px left margin so the bars always start right at the left side
+        margin=dict(l=210, r=25, t=40, b=40),
     )
-)
 
-max_x = max(plot_df["total_works"].max(), plot_df["overdue_works"].max(), 1)
-chart_height = max(450, len(plot_df) * 38 + 120)
-
-fig.update_layout(
-    barmode="overlay",
-    height=chart_height,
-    xaxis=dict(
-        title="Number of Works",
-        range=[0, max_x * 1.38],
-        gridcolor="rgba(200, 200, 200, 0.25)",
-    ),
-    yaxis=dict(
-        title=view_choice,
-        automargin=True,
-    ),
-    legend=dict(
-        orientation="h",
-        yanchor="bottom",
-        y=1.02,
-        xanchor="right",
-        x=1,
-    ),
-    margin=dict(l=20, r=180, t=50, b=40),
-)
-
-st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------------------------------------------------------------
 # DETAILED SUMMARY TABLE & SHEET DIAGNOSTICS
