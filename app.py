@@ -409,7 +409,7 @@ denominator_mode = st.sidebar.radio(
     "Total Works Assigned Count Basis:",
     options=[
         "All Works Assigned (All Statuses)",
-        "Only Ongoing Works (Status = 'P')",
+        "Only Ongoing Works (Status = 'Progress')",
     ],
     index=0,
 )
