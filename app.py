@@ -71,9 +71,10 @@ COL_AEE = "ಸಹಾಯಕ ಕಾರ್ಯಪಾಲಕ ಇಂಜಿನಿಯರ�
 COL_TARGET_DATE = "ಕಾಮಗಾರಿ ಮುಕ್ತಾಯಗೊಳಿಸಬೇಕಾದ ದಿನಾಂಕ"
 COL_ACTUAL_DATE = "ಮುಕ್ತಾಯವಾದ ದಿನಾಂಕ"
 
-DEFAULT_SHEET_URL = (
-    "https://docs.google.com/spreadsheets/d/"
-    "13W04z-fdU3RhuVJ5vQFRpK4BBSQRJWfscPqpr7Oj2Y8/edit?gid=1055199869#gid=1055199869"
+# Keep your Google Sheet URL here or in Streamlit Secrets as SHEET_URL
+DEFAULT_SHEET_URL = st.secrets.get(
+    "SHEET_URL",
+    "PASTE_YOUR_GOOGLE_SHEET_LINK_HERE",
 )
 
 
@@ -329,11 +330,12 @@ denominator_mode = st.sidebar.radio(
 chart_style = st.sidebar.radio(
     "Bar Width Mode:",
     options=[
-        "Scale by Overdue Works (Full-Width Bars)",
         "Overlay (Overdue inside Total Works)",
+        "Scale by Overdue Works (Full-Width Bars)",
+        "Scale by Overdue Percentage (%)",
     ],
     index=0,
-    help="Full-Width Bars stretches the highest overdue bar across the full screen width.",
+    help="Choose how the horizontal bars are scaled across the page.",
 )
 
 hide_zero_overdue = st.sidebar.checkbox(
@@ -349,7 +351,7 @@ if st.sidebar.button("🔄 Refresh Live Data"):
 # -----------------------------------------------------------------------------
 st.title("📊 Minor Irrigation — Overdue Works Dashboard")
 
-if not sheet_url_input:
+if not sheet_url_input or "PASTE_YOUR_GOOGLE_SHEET_LINK_HERE" in sheet_url_input:
     st.info("Please paste your Google Sheet link in the sidebar to load the dashboard.")
     st.stop()
 
@@ -371,13 +373,26 @@ if master_df.empty:
     st.stop()
 
 # -----------------------------------------------------------------------------
-# SWITCH BETWEEN SECTION OFFICER & AEE
+# TOP CONTROLS: OFFICER VIEW & SORT ORDER
 # -----------------------------------------------------------------------------
-view_choice = st.radio(
-    "ವೀಕ್ಷಣೆ ಆಯ್ಕೆಮಾಡಿ / Select Officer View:",
-    options=[COL_SO, COL_AEE],
-    horizontal=True,
-)
+ctrl_col1, ctrl_col2 = st.columns(2)
+
+with ctrl_col1:
+    view_choice = st.radio(
+        "ವೀಕ್ಷಣೆ ಆಯ್ಕೆಮಾಡಿ / Select Officer View:",
+        options=[COL_SO, COL_AEE],
+        horizontal=True,
+    )
+
+with ctrl_col2:
+    sort_choice = st.radio(
+        "ಕ್ರಮಬದ್ಧಗೊಳಿಸಿ / Sort Chart & Table By:",
+        options=[
+            "Highest Overdue Count at Top",
+            "Highest Overdue Percentage (%) at Top",
+        ],
+        horizontal=True,
+    )
 
 group_col = "so_name" if view_choice == COL_SO else "aee_name"
 
@@ -400,11 +415,17 @@ summary_df["overdue_pct"] = (
     (summary_df["overdue_works"] / summary_df["total_works"]) * 100
 ).round(1).fillna(0.0)
 
-# Sort highest overdue at the top
-summary_df = summary_df.sort_values(
-    by=["overdue_works", "overdue_pct", "total_works"],
-    ascending=[False, False, False],
-).reset_index(drop=True)
+# Apply selected sorting option
+if sort_choice == "Highest Overdue Percentage (%) at Top":
+    summary_df = summary_df.sort_values(
+        by=["overdue_pct", "overdue_works", "total_works"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
+else:
+    summary_df = summary_df.sort_values(
+        by=["overdue_works", "overdue_pct", "total_works"],
+        ascending=[False, False, False],
+    ).reset_index(drop=True)
 
 # -----------------------------------------------------------------------------
 # KPI SUMMARY METRICS
@@ -431,7 +452,7 @@ st.divider()
 # -----------------------------------------------------------------------------
 # HORIZONTAL BAR CHART (FULL WIDTH & LEFT ALIGNED)
 # -----------------------------------------------------------------------------
-st.subheader(f"📈 Overdue Works by {view_choice}")
+st.subheader(f"📈 Overdue Works by {view_choice} ({sort_choice})")
 
 chart_source_df = (
     summary_df[summary_df["overdue_works"] > 0].copy()
@@ -442,19 +463,28 @@ chart_source_df = (
 if chart_source_df.empty:
     st.info("No officers match the current filter.")
 else:
-    # Reverse order so highest overdue renders at the TOP of the horizontal bar chart
+    # Reverse order so the top-ranked row renders at the TOP of the horizontal bar chart
     plot_df = chart_source_df.iloc[::-1].copy()
 
-    # Create compact Y-axis display labels so long strings never push the chart right
+    # Keep Y-axis labels compact so long strings never push the chart right
     plot_df["y_short"] = plot_df[view_choice].map(lambda s: shorten_label(s, 28))
 
-    plot_df["bar_label"] = plot_df.apply(
-        lambda r: (
-            f"  <b>{int(r['overdue_works'])} Overdue</b> / "
-            f"{int(r['total_works'])} Total ({r['overdue_pct']:.1f}%)"
-        ),
-        axis=1,
-    )
+    if sort_choice == "Highest Overdue Percentage (%) at Top":
+        plot_df["bar_label"] = plot_df.apply(
+            lambda r: (
+                f"  <b>{r['overdue_pct']:.1f}% Overdue</b> "
+                f"({int(r['overdue_works'])} Overdue / {int(r['total_works'])} Total)"
+            ),
+            axis=1,
+        )
+    else:
+        plot_df["bar_label"] = plot_df.apply(
+            lambda r: (
+                f"  <b>{int(r['overdue_works'])} Overdue</b> / "
+                f"{int(r['total_works'])} Total ({r['overdue_pct']:.1f}%)"
+            ),
+            axis=1,
+        )
 
     fig = go.Figure()
 
@@ -486,7 +516,40 @@ else:
             )
         )
         max_x = max(int(plot_df["overdue_works"].max()), 1)
-        x_range_max = max_x * 1.24
+        x_range_max = max_x * 1.30
+        x_axis_title = "Number of Overdue Works"
+
+    elif chart_style == "Scale by Overdue Percentage (%)":
+        fig.add_trace(
+            go.Bar(
+                y=plot_df[view_choice],
+                x=plot_df["overdue_pct"],
+                name="Overdue %",
+                orientation="h",
+                marker=dict(
+                    color="#EF4444",
+                    line=dict(color="#DC2626", width=1),
+                ),
+                text=plot_df["bar_label"],
+                textposition="outside",
+                textfont=dict(size=13),
+                cliponaxis=False,
+                customdata=plot_df[
+                    [view_choice, "total_works", "ongoing_p_works", "overdue_works"]
+                ],
+                hovertemplate=(
+                    f"<b>{view_choice}:</b> %{{customdata[0]}}<br>"
+                    "<b>Overdue Percentage:</b> %{x:.1f}%<br>"
+                    "<b>Overdue Works:</b> %{customdata[3]}<br>"
+                    "<b>Total Works Assigned:</b> %{customdata[1]}<br>"
+                    "<b>Ongoing ('P') Works:</b> %{customdata[2]}<extra></extra>"
+                ),
+            )
+        )
+        max_x = max(float(plot_df["overdue_pct"].max()), 1.0)
+        x_range_max = max_x * 1.30
+        x_axis_title = "Overdue Percentage (%)"
+
     else:
         # Overlay mode: Total Works Assigned in background, Overdue Works in foreground
         fig.add_trace(
@@ -530,7 +593,8 @@ else:
             )
         )
         max_x = max(int(plot_df["total_works"].max()), 1)
-        x_range_max = max_x * 1.24
+        x_range_max = max_x * 1.32
+        x_axis_title = "Number of Works"
 
     chart_height = max(500, len(plot_df) * 36 + 90)
 
@@ -539,7 +603,7 @@ else:
         height=chart_height,
         bargap=0.22,
         xaxis=dict(
-            title="Number of Works",
+            title=x_axis_title,
             range=[0, x_range_max],
             gridcolor="rgba(200, 200, 200, 0.2)",
             zeroline=True,
@@ -559,8 +623,7 @@ else:
             xanchor="left",
             x=0,
         ),
-        # Fixed 210px left margin so the bars always start right at the left side
-        margin=dict(l=210, r=25, t=40, b=40),
+        margin=dict(l=210, r=40, t=40, b=40),
     )
 
     st.plotly_chart(fig, use_container_width=True)
