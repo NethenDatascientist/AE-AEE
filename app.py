@@ -18,7 +18,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Force full screen width and fix top metric clipping
+# Force full screen width and prevent top metric clipping
 st.markdown(
     """
     <style>
@@ -70,8 +70,9 @@ COL_SO = "ಶಾಖಾಧಿಕಾರಿಯ ಹೆಸರು"
 COL_AEE = "ಸಹಾಯಕ ಕಾರ್ಯಪಾಲಕ ಇಂಜಿನಿಯರ್ ಹೆಸರು"
 COL_TARGET_DATE = "ಕಾಮಗಾರಿ ಮುಕ್ತಾಯಗೊಳಿಸಬೇಕಾದ ದಿನಾಂಕ"
 COL_ACTUAL_DATE = "ಮುಕ್ತಾಯವಾದ ದಿನಾಂಕ"
+COL_STATUS_STD = "CP/CF/P/TBS/TP/ETS/OTH"
 
-# Keep your Google Sheet URL here or in Streamlit Secrets as SHEET_URL
+# Set SHEET_URL in Streamlit Secrets or replace the placeholder below:
 DEFAULT_SHEET_URL = st.secrets.get(
     "SHEET_URL",
     "PASTE_YOUR_GOOGLE_SHEET_LINK_HERE",
@@ -86,6 +87,17 @@ def normalize_text(val) -> str:
     if pd.isna(val):
         return ""
     return re.sub(r"\s+", " ", str(val)).strip()
+
+
+def format_cell_for_display(val) -> str:
+    """Format raw Excel cell values cleanly for table display and export."""
+    if pd.isna(val):
+        return ""
+    if isinstance(val, (datetime, pd.Timestamp)):
+        return val.strftime("%d-%m-%Y")
+    if isinstance(val, float) and val.is_integer():
+        return str(int(val))
+    return normalize_text(val)
 
 
 def extract_export_url(sheet_url: str) -> str:
@@ -125,6 +137,36 @@ def find_matching_column_indices(headers: list[str]) -> dict:
             col_idx_map["status"] = idx
 
     return col_idx_map
+
+
+def build_clean_unique_headers(raw_headers: list[str], col_idx_map: dict) -> list[str]:
+    """
+    Standardize key column names across sheets and deduplicate any repeated
+    headers so pd.concat combines all 23 worksheets cleanly.
+    """
+    standardized = list(raw_headers)
+    if "so" in col_idx_map:
+        standardized[col_idx_map["so"]] = COL_SO
+    if "aee" in col_idx_map:
+        standardized[col_idx_map["aee"]] = COL_AEE
+    if "target_date" in col_idx_map:
+        standardized[col_idx_map["target_date"]] = COL_TARGET_DATE
+    if "actual_date" in col_idx_map:
+        standardized[col_idx_map["actual_date"]] = COL_ACTUAL_DATE
+    if "status" in col_idx_map:
+        standardized[col_idx_map["status"]] = COL_STATUS_STD
+
+    seen = {}
+    unique_headers = []
+    for idx, h in enumerate(standardized):
+        base = h if h else f"Unnamed_Col_{idx + 1}"
+        if base not in seen:
+            seen[base] = 1
+            unique_headers.append(base)
+        else:
+            seen[base] += 1
+            unique_headers.append(f"{base} ({seen[base]})")
+    return unique_headers
 
 
 def parse_indian_date(series: pd.Series) -> pd.Series:
@@ -175,9 +217,17 @@ def shorten_label(name: str, max_len: int = 26) -> str:
     return name if len(name) <= max_len else name[: max_len - 1] + "…"
 
 
+def convert_df_to_excel_bytes(df: pd.DataFrame) -> bytes:
+    """Export a DataFrame to an in-memory .xlsx file."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Overdue_Works")
+    return output.getvalue()
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def load_and_process_sheets(sheet_url: str):
-    """Download the workbook and extract records from the 23 specified sheets."""
+    """Download the workbook and extract summary + full row records from the 23 sheets."""
     export_url = extract_export_url(sheet_url)
     response = requests.get(export_url, timeout=60)
     response.raise_for_status()
@@ -191,6 +241,7 @@ def load_and_process_sheets(sheet_url: str):
     today_ist = pd.Timestamp(datetime.now(ZoneInfo("Asia/Kolkata")).date())
 
     compiled_rows = []
+    full_overdue_rows = []
     sheet_diagnostics = []
 
     for target in TARGET_SHEETS:
@@ -228,8 +279,8 @@ def load_and_process_sheets(sheet_url: str):
                 )
                 continue
 
-            headers = [normalize_text(col) for col in raw_df.iloc[header_idx].values]
-            col_idx_map = find_matching_column_indices(headers)
+            raw_headers = [normalize_text(col) for col in raw_df.iloc[header_idx].values]
+            col_idx_map = find_matching_column_indices(raw_headers)
 
             required_keys = {"so", "aee", "target_date", "actual_date", "status"}
             missing_keys = required_keys - set(col_idx_map.keys())
@@ -252,40 +303,70 @@ def load_and_process_sheets(sheet_url: str):
             s_target_raw = df.iloc[:, col_idx_map["target_date"]]
             s_actual_raw = df.iloc[:, col_idx_map["actual_date"]]
 
+            target_dt = parse_indian_date(s_target_raw)
+            actual_empty = is_empty_date(s_actual_raw)
+            is_status_p = s_status.str.upper() == "P"
+
+            is_overdue = (
+                is_status_p
+                & target_dt.notna()
+                & (target_dt < today_ist)
+                & actual_empty
+            )
+
+            valid_row_mask = (s_status != "") | (s_so != "") | (s_aee != "")
+
             sub = pd.DataFrame(
                 {
                     "sheet_name": target,
                     "so_name": s_so,
                     "aee_name": s_aee,
                     "status_raw": s_status,
-                    "target_date_raw": s_target_raw.map(normalize_text),
-                    "actual_date_raw": s_actual_raw.map(normalize_text),
-                    "target_dt": parse_indian_date(s_target_raw),
-                    "actual_empty": is_empty_date(s_actual_raw),
+                    "target_date_raw": s_target_raw.map(format_cell_for_display),
+                    "actual_date_raw": s_actual_raw.map(format_cell_for_display),
+                    "target_dt": target_dt,
+                    "actual_empty": actual_empty,
+                    "is_status_p": is_status_p,
+                    "is_overdue": is_overdue,
                 }
             )
-
-            sub = sub[
-                (sub["status_raw"] != "")
-                | (sub["so_name"] != "")
-                | (sub["aee_name"] != "")
-            ].reset_index(drop=True)
-
-            sub["is_status_p"] = sub["status_raw"].str.upper() == "P"
-
-            sub["is_overdue"] = (
-                sub["is_status_p"]
-                & sub["target_dt"].notna()
-                & (sub["target_dt"] < today_ist)
-                & sub["actual_empty"]
-            )
-
+            sub = sub[valid_row_mask].reset_index(drop=True)
             compiled_rows.append(sub)
+
+            # Build full-column table for overdue works in this sheet
+            overdue_mask = valid_row_mask & is_overdue
+            if overdue_mask.any():
+                unique_headers = build_clean_unique_headers(raw_headers, col_idx_map)
+                full_df = df.loc[overdue_mask].copy()
+                full_df.columns = unique_headers
+
+                # Drop completely empty unnamed columns
+                unnamed_cols = [
+                    c for c in full_df.columns if c.startswith("Unnamed_Col_")
+                ]
+                for u_col in unnamed_cols:
+                    if full_df[u_col].map(format_cell_for_display).eq("").all():
+                        full_df.drop(columns=[u_col], inplace=True)
+
+                # Format all cells cleanly as strings for display & export
+                for col in full_df.columns:
+                    full_df[col] = full_df[col].map(format_cell_for_display)
+
+                # Insert Worksheet name as the first column
+                full_df.insert(0, "Worksheet / ಯೋಜನೆ", target)
+
+                # Attach internal filter keys for officer selection
+                full_df["_so_name"] = s_so.loc[overdue_mask].values
+                full_df["_aee_name"] = s_aee.loc[overdue_mask].values
+
+                full_overdue_rows.append(full_df.reset_index(drop=True))
+
             sheet_diagnostics.append(
                 {
                     "Sheet": target,
                     "Status": "Loaded",
                     "Rows Loaded": len(sub),
+                    "Overdue Rows": int(overdue_mask.sum()),
                 }
             )
 
@@ -295,6 +376,7 @@ def load_and_process_sheets(sheet_url: str):
                     "Sheet": target,
                     "Status": f"Error: {sheet_err}",
                     "Rows Loaded": 0,
+                    "Overdue Rows": 0,
                 }
             )
 
@@ -303,8 +385,13 @@ def load_and_process_sheets(sheet_url: str):
         if compiled_rows
         else pd.DataFrame()
     )
+    overdue_full_df = (
+        pd.concat(full_overdue_rows, ignore_index=True).fillna("")
+        if full_overdue_rows
+        else pd.DataFrame()
+    )
     diag_df = pd.DataFrame(sheet_diagnostics)
-    return master_df, diag_df, today_ist.strftime("%d-%m-%Y")
+    return master_df, overdue_full_df, diag_df, today_ist.strftime("%d-%m-%Y")
 
 
 # -----------------------------------------------------------------------------
@@ -357,7 +444,9 @@ if not sheet_url_input or "PASTE_YOUR_GOOGLE_SHEET_LINK_HERE" in sheet_url_input
 
 with st.spinner("Fetching and processing 23 worksheets from Google Sheets..."):
     try:
-        master_df, diag_df, today_str = load_and_process_sheets(sheet_url_input)
+        master_df, overdue_full_df, diag_df, today_str = load_and_process_sheets(
+            sheet_url_input
+        )
     except requests.HTTPError as http_err:
         st.error(
             f"Google Sheets HTTP Error: Make sure link sharing is set to 'Anyone with the link can view'.\n\nDetails: {http_err}"
@@ -395,6 +484,7 @@ with ctrl_col2:
     )
 
 group_col = "so_name" if view_choice == COL_SO else "aee_name"
+full_filter_col = "_so_name" if view_choice == COL_SO else "_aee_name"
 
 valid_df = master_df[master_df[group_col].map(is_valid_officer_name)].copy()
 
@@ -463,10 +553,7 @@ chart_source_df = (
 if chart_source_df.empty:
     st.info("No officers match the current filter.")
 else:
-    # Reverse order so the top-ranked row renders at the TOP of the horizontal bar chart
     plot_df = chart_source_df.iloc[::-1].copy()
-
-    # Keep Y-axis labels compact so long strings never push the chart right
     plot_df["y_short"] = plot_df[view_choice].map(lambda s: shorten_label(s, 28))
 
     if sort_choice == "Highest Overdue Percentage (%) at Top":
@@ -551,7 +638,6 @@ else:
         x_axis_title = "Overdue Percentage (%)"
 
     else:
-        # Overlay mode: Total Works Assigned in background, Overdue Works in foreground
         fig.add_trace(
             go.Bar(
                 y=plot_df[view_choice],
@@ -629,7 +715,7 @@ else:
     st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------------------------------------------------------------
-# DETAILED SUMMARY TABLE & SHEET DIAGNOSTICS
+# DETAILED SUMMARY TABLE
 # -----------------------------------------------------------------------------
 st.subheader("📋 Officer-Wise Summary Table")
 
@@ -647,6 +733,101 @@ st.dataframe(
     display_table.style.format({"Overdue %": "{:.1f}%"}),
     use_container_width=True,
 )
+
+st.divider()
+
+# -----------------------------------------------------------------------------
+# BOTTOM SECTION: OFFICER DROPDOWN & COMBINED OVERDUE WORKS TABLE + DOWNLOAD
+# -----------------------------------------------------------------------------
+st.subheader(
+    f"📂 ಅಧಿಕಾರಿಗಳ ವಾರು ಅವಧಿ ಮೀರಿದ ಕಾಮಗಾರಿಗಳ ವಿವರ / Combined Overdue Works by {view_choice}"
+)
+
+officer_options = summary_df[view_choice].tolist()
+
+# Build lookup dictionary so the dropdown shows overdue counts next to each name
+officer_stats_map = {
+    row[view_choice]: (
+        int(row["overdue_works"]),
+        int(row["total_works"]),
+        float(row["overdue_pct"]),
+    )
+    for _, row in summary_df.iterrows()
+}
+
+selected_officer = st.selectbox(
+    f"Select {view_choice} to view and download all their Overdue Works across all worksheets:",
+    options=officer_options,
+    index=0 if officer_options else None,
+    format_func=lambda name: (
+        f"{name}  —  ({officer_stats_map[name][0]} Overdue / "
+        f"{officer_stats_map[name][1]} Total | {officer_stats_map[name][2]:.1f}%)"
+    ),
+)
+
+if selected_officer:
+    if overdue_full_df.empty:
+        st.info("No overdue works found across the 23 worksheets.")
+    else:
+        officer_overdue_df = overdue_full_df[
+            overdue_full_df[full_filter_col] == selected_officer
+        ].copy()
+
+        # Remove internal helper columns before showing or downloading
+        internal_cols = [c for c in ["_so_name", "_aee_name"] if c in officer_overdue_df.columns]
+        officer_overdue_df.drop(columns=internal_cols, inplace=True)
+
+        # Drop any columns that are completely blank for this officer only if they were Unnamed
+        extra_unnamed = [
+            c
+            for c in officer_overdue_df.columns
+            if c.startswith("Unnamed_Col_") and officer_overdue_df[c].eq("").all()
+        ]
+        if extra_unnamed:
+            officer_overdue_df.drop(columns=extra_unnamed, inplace=True)
+
+        officer_overdue_df = officer_overdue_df.reset_index(drop=True)
+        officer_overdue_df.index = officer_overdue_df.index + 1
+        officer_overdue_df.index.name = "Sl. No."
+
+        if officer_overdue_df.empty:
+            st.success(f"🎉 **{selected_officer}** has **0** overdue works!")
+        else:
+            sheets_involved = officer_overdue_df["Worksheet / ಯೋಜನೆ"].unique().tolist()
+            st.markdown(
+                f"**Selected {view_choice}:** `{selected_officer}` &nbsp;|&nbsp; "
+                f"**Total Overdue Works:** `{len(officer_overdue_df)}` &nbsp;|&nbsp; "
+                f"**Worksheets:** `{', '.join(sheets_involved)}`"
+            )
+
+            # Safe filename for downloads
+            safe_name = re.sub(r"[^\w\-]+", "_", selected_officer).strip("_") or "Officer"
+            excel_bytes = convert_df_to_excel_bytes(officer_overdue_df.reset_index())
+            csv_bytes = officer_overdue_df.reset_index().to_csv(index=False).encode("utf-8-sig")
+
+            dl_col1, dl_col2, _ = st.columns([1.5, 1.5, 5])
+            with dl_col1:
+                st.download_button(
+                    label="📥 Download Excel (.xlsx)",
+                    data=excel_bytes,
+                    file_name=f"Overdue_Works_{safe_name}_{today_str}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            with dl_col2:
+                st.download_button(
+                    label="📥 Download CSV (.csv)",
+                    data=csv_bytes,
+                    file_name=f"Overdue_Works_{safe_name}_{today_str}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+
+            st.dataframe(
+                officer_overdue_df,
+                use_container_width=True,
+                height=min(600, max(220, (len(officer_overdue_df) + 1) * 42)),
+            )
 
 with st.expander("🔍 Inspect Worksheet Loading Status (23 Target Sheets)"):
     st.dataframe(diag_df, use_container_width=True)
