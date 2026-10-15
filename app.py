@@ -1,8 +1,13 @@
 import io
+import os
+import pickle
 import re
+import threading
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import openpyxl
 import pandas as pd
 import plotly.graph_objects as go
 import requests
@@ -18,7 +23,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Force full screen width and prevent top metric clipping
 st.markdown(
     """
     <style>
@@ -72,11 +76,20 @@ COL_TARGET_DATE = "ಕಾಮಗಾರಿ ಮುಕ್ತಾಯಗೊಳಿಸಬ
 COL_ACTUAL_DATE = "ಮುಕ್ತಾಯವಾದ ದಿನಾಂಕ"
 COL_STATUS_STD = "CP/CF/P/TBS/TP/ETS/OTH"
 
-# Set SHEET_URL in Streamlit Secrets or replace the placeholder below:
 DEFAULT_SHEET_URL = st.secrets.get(
     "SHEET_URL",
-    "PASTE_YOUR_GOOGLE_SHEET_LINK_HERE",
+    "https://docs.google.com/spreadsheets/d/13W04z-fdU3RhuVJ5vQFRpK4BBSQRJWfscPqpr7Oj2Y8/edit?gid=1055199869#gid=1055199869",
 )
+
+BACKUP_CACHE_PATH = "/tmp/mi_overdue_dashboard_backup.pkl"
+
+
+# -----------------------------------------------------------------------------
+# GLOBAL LOCK (Prevents simultaneous requests from colliding with 410 Gone)
+# -----------------------------------------------------------------------------
+@st.cache_resource
+def get_download_lock() -> threading.Lock:
+    return threading.Lock()
 
 
 # -----------------------------------------------------------------------------
@@ -84,14 +97,14 @@ DEFAULT_SHEET_URL = st.secrets.get(
 # -----------------------------------------------------------------------------
 def normalize_text(val) -> str:
     """Collapse multiple spaces/newlines and strip text."""
-    if pd.isna(val):
+    if val is None or pd.isna(val):
         return ""
     return re.sub(r"\s+", " ", str(val)).strip()
 
 
 def format_cell_for_display(val) -> str:
     """Format raw Excel cell values cleanly for table display and export."""
-    if pd.isna(val):
+    if val is None or pd.isna(val):
         return ""
     if isinstance(val, (datetime, pd.Timestamp)):
         return val.strftime("%d-%m-%Y")
@@ -100,13 +113,65 @@ def format_cell_for_display(val) -> str:
     return normalize_text(val)
 
 
-def extract_export_url(sheet_url: str) -> str:
-    """Convert a standard Google Sheets edit link into an xlsx export URL."""
+def extract_spreadsheet_key(sheet_url: str) -> str:
+    """Extract the Google Spreadsheet ID from the URL."""
     match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", sheet_url)
     if not match:
         raise ValueError("Invalid Google Sheet URL. Could not extract spreadsheet key.")
-    spreadsheet_key = match.group(1)
-    return f"https://docs.google.com/spreadsheets/d/{spreadsheet_key}/export?format=xlsx"
+    return match.group(1)
+
+
+def download_workbook_bytes(sheet_url: str) -> bytes:
+    """
+    Download the Google Sheet as .xlsx with retry logic, browser headers,
+    180-second streaming timeout, and fallback export endpoints to avoid 410 Gone.
+    """
+    key = extract_spreadsheet_key(sheet_url)
+    candidate_urls = [
+        f"https://docs.google.com/spreadsheets/d/{key}/export?format=xlsx",
+        f"https://docs.google.com/spreadsheets/d/{key}/export?format=xlsx&id={key}",
+        f"https://drive.google.com/uc?export=download&id={key}",
+    ]
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/128.0.0.0 Safari/537.36"
+        ),
+        "Accept": "*/*",
+        "Cache-Control": "no-cache",
+    }
+
+    last_error = None
+    for attempt in range(3):
+        url = candidate_urls[attempt % len(candidate_urls)]
+        # Add cache-buster on retries so Google generates a fresh export stream
+        if attempt > 0:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}t={int(time.time())}"
+
+        try:
+            with requests.Session() as session:
+                with session.get(
+                    url,
+                    headers=headers,
+                    timeout=(20, 180),
+                    stream=True,
+                    allow_redirects=True,
+                ) as resp:
+                    resp.raise_for_status()
+                    chunks = []
+                    for chunk in resp.iter_content(chunk_size=262144):
+                        if chunk:
+                            chunks.append(chunk)
+                    content = b"".join(chunks)
+                    if len(content) > 1000:
+                        return content
+        except Exception as err:
+            last_error = err
+            time.sleep(2 * (attempt + 1))
+
+    raise RuntimeError(f"Failed after 3 download attempts. Last error: {last_error}")
 
 
 def find_matching_column_indices(headers: list[str]) -> dict:
@@ -140,10 +205,7 @@ def find_matching_column_indices(headers: list[str]) -> dict:
 
 
 def build_clean_unique_headers(raw_headers: list[str], col_idx_map: dict) -> list[str]:
-    """
-    Standardize key column names across sheets and deduplicate any repeated
-    headers so pd.concat combines all 23 worksheets cleanly.
-    """
+    """Standardize key column names across sheets and deduplicate repeated headers."""
     standardized = list(raw_headers)
     if "so" in col_idx_map:
         standardized[col_idx_map["so"]] = COL_SO
@@ -172,9 +234,9 @@ def build_clean_unique_headers(raw_headers: list[str], col_idx_map: dict) -> lis
 def parse_indian_date(series: pd.Series) -> pd.Series:
     """Safely parse dates (handling datetime objects and DD-MM-YYYY / DD.MM.YYYY strings)."""
     def _clean_date(val):
-        if pd.isna(val):
+        if val is None or pd.isna(val):
             return pd.NaT
-        if isinstance(val, datetime):
+        if isinstance(val, (datetime, pd.Timestamp)):
             return pd.Timestamp(val.date())
         s = normalize_text(val)
         if not s or s.upper() in {"-", "--", "NIL", "NA", "N/A", "NONE", ""}:
@@ -189,7 +251,7 @@ def parse_indian_date(series: pd.Series) -> pd.Series:
 def is_empty_date(series: pd.Series) -> pd.Series:
     """Check if the 'ಮುಕ್ತಾಯವಾದ ದಿನಾಂಕ' cell is empty or placeholder text."""
     def _check_empty(val):
-        if pd.isna(val):
+        if val is None or pd.isna(val):
             return True
         s = normalize_text(val)
         return s.upper() in {"", "-", "--", "NIL", "NA", "N/A", "NONE", "NAT"}
@@ -225,17 +287,16 @@ def convert_df_to_excel_bytes(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def load_and_process_sheets(sheet_url: str):
-    """Download the workbook and extract summary + full row records from the 23 sheets."""
-    export_url = extract_export_url(sheet_url)
-    response = requests.get(export_url, timeout=60)
-    response.raise_for_status()
-
-    excel_file = pd.ExcelFile(io.BytesIO(response.content), engine="openpyxl")
+def parse_workbook_bytes(workbook_bytes: bytes):
+    """Parse the 23 target worksheets using fast read-only OpenPyXL mode."""
+    wb = openpyxl.load_workbook(
+        io.BytesIO(workbook_bytes),
+        read_only=True,
+        data_only=True,
+    )
 
     available_sheets = {
-        normalize_text(name).lower(): name for name in excel_file.sheet_names
+        normalize_text(name).lower(): name for name in wb.sheetnames
     }
 
     today_ist = pd.Timestamp(datetime.now(ZoneInfo("Asia/Kolkata")).date())
@@ -250,17 +311,30 @@ def load_and_process_sheets(sheet_url: str):
 
         if not actual_sheet_name:
             sheet_diagnostics.append(
-                {"Sheet": target, "Status": "Missing in Workbook", "Rows Loaded": 0}
+                {
+                    "Sheet": target,
+                    "Status": "Missing in Workbook",
+                    "Rows Loaded": 0,
+                    "Overdue Rows": 0,
+                }
             )
             continue
 
         try:
-            raw_df = pd.read_excel(excel_file, sheet_name=actual_sheet_name, header=None)
-            if raw_df.empty:
+            ws = wb[actual_sheet_name]
+            rows_list = list(ws.iter_rows(values_only=True))
+            if not rows_list:
                 sheet_diagnostics.append(
-                    {"Sheet": target, "Status": "Empty Sheet", "Rows Loaded": 0}
+                    {
+                        "Sheet": target,
+                        "Status": "Empty Sheet",
+                        "Rows Loaded": 0,
+                        "Overdue Rows": 0,
+                    }
                 )
                 continue
+
+            raw_df = pd.DataFrame(rows_list)
 
             header_idx = None
             for idx in range(min(25, len(raw_df))):
@@ -275,7 +349,12 @@ def load_and_process_sheets(sheet_url: str):
 
             if header_idx is None:
                 sheet_diagnostics.append(
-                    {"Sheet": target, "Status": "Header Row Not Found", "Rows Loaded": 0}
+                    {
+                        "Sheet": target,
+                        "Status": "Header Row Not Found",
+                        "Rows Loaded": 0,
+                        "Overdue Rows": 0,
+                    }
                 )
                 continue
 
@@ -291,6 +370,7 @@ def load_and_process_sheets(sheet_url: str):
                         "Sheet": target,
                         "Status": f"Missing Columns: {', '.join(sorted(missing_keys))}",
                         "Rows Loaded": 0,
+                        "Overdue Rows": 0,
                     }
                 )
                 continue
@@ -333,14 +413,12 @@ def load_and_process_sheets(sheet_url: str):
             sub = sub[valid_row_mask].reset_index(drop=True)
             compiled_rows.append(sub)
 
-            # Build full-column table for overdue works in this sheet
             overdue_mask = valid_row_mask & is_overdue
             if overdue_mask.any():
                 unique_headers = build_clean_unique_headers(raw_headers, col_idx_map)
                 full_df = df.loc[overdue_mask].copy()
                 full_df.columns = unique_headers
 
-                # Drop completely empty unnamed columns
                 unnamed_cols = [
                     c for c in full_df.columns if c.startswith("Unnamed_Col_")
                 ]
@@ -348,14 +426,10 @@ def load_and_process_sheets(sheet_url: str):
                     if full_df[u_col].map(format_cell_for_display).eq("").all():
                         full_df.drop(columns=[u_col], inplace=True)
 
-                # Format all cells cleanly as strings for display & export
                 for col in full_df.columns:
                     full_df[col] = full_df[col].map(format_cell_for_display)
 
-                # Insert Worksheet name as the first column
                 full_df.insert(0, "Worksheet / ಯೋಜನೆ", target)
-
-                # Attach internal filter keys for officer selection
                 full_df["_so_name"] = s_so.loc[overdue_mask].values
                 full_df["_aee_name"] = s_aee.loc[overdue_mask].values
 
@@ -380,6 +454,8 @@ def load_and_process_sheets(sheet_url: str):
                 }
             )
 
+    wb.close()
+
     master_df = (
         pd.concat(compiled_rows, ignore_index=True)
         if compiled_rows
@@ -394,6 +470,42 @@ def load_and_process_sheets(sheet_url: str):
     return master_df, overdue_full_df, diag_df, today_ist.strftime("%d-%m-%Y")
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def load_and_process_sheets_cached(sheet_url: str):
+    """Download and parse with cache + disk backup."""
+    workbook_bytes = download_workbook_bytes(sheet_url)
+    result = parse_workbook_bytes(workbook_bytes)
+    try:
+        with open(BACKUP_CACHE_PATH, "wb") as f:
+            pickle.dump(result, f)
+    except Exception:
+        pass
+    return result
+
+
+def get_dashboard_data(sheet_url: str, uploaded_file=None):
+    """
+    Thread-safe wrapper so multiple simultaneous users never trigger
+    colliding Google Sheet downloads (410 Gone / Read Timeout).
+    """
+    if uploaded_file is not None:
+        return parse_workbook_bytes(uploaded_file.getvalue()), False
+
+    lock = get_download_lock()
+    with lock:
+        try:
+            return load_and_process_sheets_cached(sheet_url), False
+        except Exception as live_err:
+            # If a backup exists from an earlier successful load, serve it seamlessly
+            if os.path.exists(BACKUP_CACHE_PATH):
+                try:
+                    with open(BACKUP_CACHE_PATH, "rb") as f:
+                        return pickle.load(f), True
+                except Exception:
+                    pass
+            raise live_err
+
+
 # -----------------------------------------------------------------------------
 # SIDEBAR CONTROLS
 # -----------------------------------------------------------------------------
@@ -403,6 +515,12 @@ sheet_url_input = st.sidebar.text_input(
     "Google Spreadsheet Link",
     value=DEFAULT_SHEET_URL,
     help="Ensure the Google Sheet is set to 'Anyone with the link can view'.",
+)
+
+uploaded_xlsx = st.sidebar.file_uploader(
+    "Or Upload Workbook (.xlsx) Directly (Optional Backup)",
+    type=["xlsx"],
+    help="If Google Sheets is slow during a live presentation, upload the downloaded .xlsx file here.",
 )
 
 denominator_mode = st.sidebar.radio(
@@ -438,22 +556,25 @@ if st.sidebar.button("🔄 Refresh Live Data"):
 # -----------------------------------------------------------------------------
 st.title("📊 Minor Irrigation — Overdue Works Dashboard")
 
-if not sheet_url_input or "PASTE_YOUR_GOOGLE_SHEET_LINK_HERE" in sheet_url_input:
-    st.info("Please paste your Google Sheet link in the sidebar to load the dashboard.")
+if not sheet_url_input and uploaded_xlsx is None:
+    st.info("Please paste your Google Sheet link or upload the .xlsx file in the sidebar.")
     st.stop()
 
-with st.spinner("Fetching and processing 23 worksheets from Google Sheets..."):
+with st.spinner("Fetching and processing 23 worksheets..."):
     try:
-        master_df, overdue_full_df, diag_df, today_str = load_and_process_sheets(
-            sheet_url_input
+        (master_df, overdue_full_df, diag_df, today_str), used_backup = get_dashboard_data(
+            sheet_url_input, uploaded_xlsx
         )
-    except requests.HTTPError as http_err:
-        st.error(
-            f"Google Sheets HTTP Error: Make sure link sharing is set to 'Anyone with the link can view'.\n\nDetails: {http_err}"
-        )
-        st.stop()
+        if used_backup:
+            st.warning(
+                "⚡ Google Sheets took too long to respond to concurrent requests — displaying the most recent cached snapshot."
+            )
     except Exception as e:
-        st.error(f"Error while processing workbook: {e}")
+        st.error(
+            f"Google Sheets is temporarily throttling live export requests.\n\n"
+            f"**Quick Fix:** Wait 10 seconds and reload, or upload the `.xlsx` file in the left sidebar.\n\n"
+            f"Technical Details: {e}"
+        )
         st.stop()
 
 if master_df.empty:
@@ -488,7 +609,7 @@ full_filter_col = "_so_name" if view_choice == COL_SO else "_aee_name"
 
 valid_df = master_df[master_df[group_col].map(is_valid_officer_name)].copy()
 
-if denominator_mode == "Only Ongoing Works (Status = 'P')":
+if denominator_mode.startswith("Only Ongoing Works"):
     valid_df = valid_df[valid_df["is_status_p"]].copy()
 
 summary_df = (
@@ -505,7 +626,6 @@ summary_df["overdue_pct"] = (
     (summary_df["overdue_works"] / summary_df["total_works"]) * 100
 ).round(1).fillna(0.0)
 
-# Apply selected sorting option
 if sort_choice == "Highest Overdue Percentage (%) at Top":
     summary_df = summary_df.sort_values(
         by=["overdue_pct", "overdue_works", "total_works"],
@@ -597,7 +717,7 @@ else:
                     f"<b>{view_choice}:</b> %{{customdata[0]}}<br>"
                     "<b>Overdue Works:</b> %{x}<br>"
                     "<b>Total Works Assigned:</b> %{customdata[1]}<br>"
-                    "<b>Ongoing ('P') Works:</b> %{customdata[2]}<br>"
+                    "<b>Ongoing ('Progress') Works:</b> %{customdata[2]}<br>"
                     "<b>Overdue Percentage:</b> %{customdata[3]:.1f}%<extra></extra>"
                 ),
             )
@@ -629,7 +749,7 @@ else:
                     "<b>Overdue Percentage:</b> %{x:.1f}%<br>"
                     "<b>Overdue Works:</b> %{customdata[3]}<br>"
                     "<b>Total Works Assigned:</b> %{customdata[1]}<br>"
-                    "<b>Ongoing ('P') Works:</b> %{customdata[2]}<extra></extra>"
+                    "<b>Ongoing ('Progress') Works:</b> %{customdata[2]}<extra></extra>"
                 ),
             )
         )
@@ -722,7 +842,7 @@ st.subheader("📋 Officer-Wise Summary Table")
 display_table = summary_df.rename(
     columns={
         "total_works": "Total Works Assigned",
-        "ongoing_p_works": "Ongoing Works ('P')",
+        "ongoing_p_works": "Ongoing Works ('Progress')",
         "overdue_works": "Overdue Works",
         "overdue_pct": "Overdue %",
     }
@@ -745,7 +865,6 @@ st.subheader(
 
 officer_options = summary_df[view_choice].tolist()
 
-# Build lookup dictionary so the dropdown shows overdue counts next to each name
 officer_stats_map = {
     row[view_choice]: (
         int(row["overdue_works"]),
@@ -773,11 +892,9 @@ if selected_officer:
             overdue_full_df[full_filter_col] == selected_officer
         ].copy()
 
-        # Remove internal helper columns before showing or downloading
         internal_cols = [c for c in ["_so_name", "_aee_name"] if c in officer_overdue_df.columns]
         officer_overdue_df.drop(columns=internal_cols, inplace=True)
 
-        # Drop any columns that are completely blank for this officer only if they were Unnamed
         extra_unnamed = [
             c
             for c in officer_overdue_df.columns
@@ -800,7 +917,6 @@ if selected_officer:
                 f"**Worksheets:** `{', '.join(sheets_involved)}`"
             )
 
-            # Safe filename for downloads
             safe_name = re.sub(r"[^\w\-]+", "_", selected_officer).strip("_") or "Officer"
             excel_bytes = convert_df_to_excel_bytes(officer_overdue_df.reset_index())
             csv_bytes = officer_overdue_df.reset_index().to_csv(index=False).encode("utf-8-sig")
